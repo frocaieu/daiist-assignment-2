@@ -16,8 +16,9 @@ Stages, with no manual steps:
      cheapest pair of thresholds (pass / human review / fail).
   7. Save everything app.py needs into artifacts/.
 
-All euro figures below are PLACEHOLDERS until REPORT.md justifies them
-(assignment step 6). Change them here; nothing else needs editing.
+Cost figures live in one block below (see REPORT.md for the justification).
+To recompute only the costs from saved test scores, without retraining:
+    COSTS_ONLY=1 uv run python main.py train
 """
 
 import csv
@@ -53,13 +54,20 @@ BATCH = int(os.environ.get("BATCH", 32))
 PATIENCE = 8
 SMOKE = os.environ.get("SMOKE") == "1"  # 1 epoch on 5% of the data, to test the pipeline
 
-# ------------------------------------------------- costs (PLACEHOLDERS, EUR)
-C_FN = 250.0    # bare head not flagged (missed violation)
-C_FP = 2.0      # helmeted head flagged (needless check)
-C_TP = 0.0      # violation correctly flagged (cost of acting on it is ignored)
-C_TN = 0.0      # correct pass
-C_REVIEW = 1.0  # one human review of one case
-BASE_RATE = 0.05  # assumed share of production cases that contain a violation
+# ------------------------------------------------------------ costs (EUR) --
+# Justified in REPORT.md. Every figure is an assumption to be defended; the
+# sensitivity table (SENS_*) shows how the answer moves when they change.
+C_FN = 100.0     # bare head not flagged: ~2,451 EUR minimum "grave" PRL fine (LISOS art. 40.2)
+                 # x an assumed 4% chance a missed violation ends in a sanction (accident costs excluded)
+C_FP = 5.0       # helmeted head wrongly FAILED (automatic action: foreman sent / work interrupted):
+                 # ~10 min of a foreman or technician at ~30 EUR/h (assumed). Must be > C_REVIEW,
+                 # otherwise failing is never worse than sending a case to review.
+C_TP = 0.0       # violation correctly flagged (cost of acting on it is ignored)
+C_TN = 0.0       # correct pass
+C_REVIEW = 0.5   # one human review of one case (~1 min at ~30 EUR/h), assumed always correct
+BASE_RATE = 0.05  # assumed share of production cases containing a violation (test split: ~29%)
+SENS_C_FN = [5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0]
+SENS_BASE_RATE = [0.01, 0.05, 0.10, 0.29]
 
 THRESHOLDS = np.round(np.arange(0.01, 1.0, 0.01), 2)
 IMG_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -247,6 +255,10 @@ def ground_truth(dataset_dir: Path, positive_id: int, split="test"):
 
 
 # ================================================================= costing ==
+def default_costs() -> dict:
+    return {"fn": C_FN, "fp": C_FP, "tp": C_TP, "tn": C_TN, "review": C_REVIEW}
+
+
 def rates_at(scores: np.ndarray, labels: np.ndarray, t: float):
     pred = scores >= t
     tp = int((pred & labels).sum())
@@ -258,49 +270,126 @@ def rates_at(scores: np.ndarray, labels: np.ndarray, t: float):
     return {"tp": tp, "fp": fp, "fn": fn, "tn": tn, "tpr": tpr, "fpr": fpr}
 
 
-def cost_per_1000(tpr: float, fpr: float, prev: float = BASE_RATE) -> float:
+def cost_per_1000(tpr: float, fpr: float, prev: float = BASE_RATE, c: dict = None) -> float:
     """Expected cost per 1,000 cases at base rate `prev`, using test TPR/FPR."""
-    pos = prev * (tpr * C_TP + (1 - tpr) * C_FN)
-    neg = (1 - prev) * (fpr * C_FP + (1 - fpr) * C_TN)
+    c = c or default_costs()
+    pos = prev * (tpr * c["tp"] + (1 - tpr) * c["fn"])
+    neg = (1 - prev) * (fpr * c["fp"] + (1 - fpr) * c["tn"])
     return 1000.0 * (pos + neg)
 
 
-def sweep(scores: np.ndarray, labels: np.ndarray) -> dict:
+def sweep(scores: np.ndarray, labels: np.ndarray, prev: float = BASE_RATE, c: dict = None) -> dict:
     rows = []
     for t in THRESHOLDS:
         r = rates_at(scores, labels, float(t))
         r["threshold"] = float(t)
-        r["cost_per_1000"] = cost_per_1000(r["tpr"], r["fpr"])
+        r["cost_per_1000"] = cost_per_1000(r["tpr"], r["fpr"], prev, c)
         rows.append(r)
     best = min(rows, key=lambda r: r["cost_per_1000"])
     return {"rows": rows, "best": best}
 
 
-def review_policy(scores: np.ndarray, labels: np.ndarray, step=0.02) -> dict:
+def review_policy(scores: np.ndarray, labels: np.ndarray, prev: float = BASE_RATE,
+                  c: dict = None) -> dict:
     """Best (t_low, t_high): score < t_low -> pass, >= t_high -> fail, between -> human review.
-    Assumes the reviewer decides correctly and costs C_REVIEW per case."""
-    pos, neg = scores[labels], scores[~labels]
-    grid = np.round(np.arange(0.0, 1.0 + 1e-9, step), 2)
-    best = None
-    for lo in grid:
-        for hi in grid[grid >= lo]:
-            pos_pass, pos_fail = (pos < lo).mean(), (pos >= hi).mean()
-            pos_rev = 1 - pos_pass - pos_fail
-            neg_pass, neg_fail = (neg < lo).mean(), (neg >= hi).mean()
-            neg_rev = 1 - neg_pass - neg_fail
-            cost = 1000 * (
-                BASE_RATE * (pos_pass * C_FN + pos_rev * C_REVIEW + pos_fail * C_TP)
-                + (1 - BASE_RATE) * (neg_pass * C_TN + neg_rev * C_REVIEW + neg_fail * C_FP)
-            )
-            review_share = BASE_RATE * pos_rev + (1 - BASE_RATE) * neg_rev
-            if best is None or cost < best["cost_per_1000"]:
-                best = {"t_low": float(lo), "t_high": float(hi),
-                        "cost_per_1000": float(cost), "review_share": float(review_share)}
-    return best
+    Searched on the same 0.01 grid as the single-threshold sweep (plus 0 and 1), so the
+    result can never be worse than the best single threshold (t_low == t_high = no review).
+    Assumes the reviewer decides correctly and costs c['review'] per case."""
+    c = c or default_costs()
+    grid = np.round(np.arange(0.0, 1.0 + 1e-9, 0.01), 2)
+    pos, neg = np.sort(scores[labels]), np.sort(scores[~labels])
+    n_pos, n_neg = len(pos), len(neg)
+    lt_pos = np.searchsorted(pos, grid, side="left")  # cases with score < grid value
+    lt_neg = np.searchsorted(neg, grid, side="left")
+    lo, hi = np.meshgrid(np.arange(len(grid)), np.arange(len(grid)), indexing="ij")
+    valid = hi >= lo
+    pos_pass = lt_pos[lo] / n_pos
+    pos_fail = (n_pos - lt_pos[hi]) / n_pos
+    pos_rev = (lt_pos[hi] - lt_pos[lo]) / n_pos
+    neg_pass = lt_neg[lo] / n_neg
+    neg_fail = (n_neg - lt_neg[hi]) / n_neg
+    neg_rev = (lt_neg[hi] - lt_neg[lo]) / n_neg
+    cost = 1000 * (
+        prev * (pos_pass * c["fn"] + pos_rev * c["review"] + pos_fail * c["tp"])
+        + (1 - prev) * (neg_pass * c["tn"] + neg_rev * c["review"] + neg_fail * c["fp"])
+    )
+    cost = np.where(valid, cost, np.inf)
+    i, j = np.unravel_index(int(np.argmin(cost)), cost.shape)
+    return {"t_low": float(grid[i]), "t_high": float(grid[j]),
+            "cost_per_1000": float(cost[i, j]),
+            "review_share": float(prev * pos_rev[i, j] + (1 - prev) * neg_rev[i, j])}
+
+
+def sensitivity(scores: np.ndarray, labels: np.ndarray) -> list:
+    """How the chosen thresholds and costs move when C_FN and the base rate change."""
+    rows = []
+    for fn in SENS_C_FN:
+        for prev in SENS_BASE_RATE:
+            c = {**default_costs(), "fn": fn}
+            single = sweep(scores, labels, prev, c)["best"]
+            pol = review_policy(scores, labels, prev, c)
+            rows.append({
+                "c_fn": fn, "base_rate": prev,
+                "single_threshold": single["threshold"],
+                "single_cost_per_1000": single["cost_per_1000"],
+                "review_t_low": pol["t_low"], "review_t_high": pol["t_high"],
+                "review_cost_per_1000": pol["cost_per_1000"],
+                "review_share": pol["review_share"],
+                "do_nothing_cost_per_1000": cost_per_1000(0.0, 0.0, prev, c),
+                "human_all_cost_per_1000": 1000.0 * c["review"],
+            })
+    return rows
+
+
+def cost_sections(s_ft: np.ndarray, s_coco: np.ndarray, labels: np.ndarray) -> dict:
+    """Everything that depends on the cost assumptions (so it can be recomputed alone)."""
+    sw_ft, sw_coco = sweep(s_ft, labels), sweep(s_coco, labels)
+    policy = review_policy(s_ft, labels)
+    return {
+        "costs_eur": {"C_FN": C_FN, "C_FP": C_FP, "C_TP": C_TP, "C_TN": C_TN,
+                      "C_REVIEW": C_REVIEW, "base_rate": BASE_RATE},
+        "test_set": {"cases": int(len(labels)), "positives": int(labels.sum()),
+                     "base_rate_in_test": float(labels.mean())},
+        "image_level": {"finetuned": sw_ft, "coco_person_proxy": sw_coco},
+        "chosen_single_threshold": sw_ft["best"],
+        "chosen_review_policy": policy,
+        "strategies_cost_per_1000": {
+            "predict_nothing_always_pass": cost_per_1000(0.0, 0.0),
+            "predict_all_always_fail": cost_per_1000(1.0, 1.0),
+            "human_checks_everything": 1000.0 * C_REVIEW,
+            "model_alone_best_threshold": sw_ft["best"]["cost_per_1000"],
+            "model_plus_human_review": policy["cost_per_1000"],
+            "coco_person_proxy_best_threshold": sw_coco["best"]["cost_per_1000"],
+        },
+        "sensitivity": sensitivity(s_ft, labels),
+    }
+
+
+def load_saved_scores():
+    rows = list(csv.DictReader(open(ARTIFACTS / "test_scores.csv")))
+    labels = np.array([int(r["has_bare_head"]) for r in rows], dtype=bool)
+    s_ft = np.array([float(r["score_finetuned"]) for r in rows])
+    s_coco = np.array([float(r["score_coco_person"]) for r in rows])
+    return s_ft, s_coco, labels
+
+
+def costs_only():
+    """Recompute only the cost sections from artifacts/test_scores.csv (no GPU, seconds)."""
+    s_ft, s_coco, labels = load_saved_scores()
+    results = json.loads((ARTIFACTS / "results.json").read_text())
+    results.update(cost_sections(s_ft, s_coco, labels))
+    results.pop("note_costs", None)
+    (ARTIFACTS / "results.json").write_text(json.dumps(results, indent=2))
+    print(json.dumps({k: results[k] for k in ("costs_eur", "test_set", "chosen_single_threshold",
+                                               "chosen_review_policy", "strategies_cost_per_1000")},
+                     indent=2))
 
 
 # ===================================================================== main ==
 def main():
+    if os.environ.get("COSTS_ONLY") == "1":
+        costs_only()
+        return
     CACHE_DIR.mkdir(exist_ok=True)
     os.chdir(CACHE_DIR)  # pretrained checkpoints are downloaded here, not into the repo root
     ARTIFACTS.mkdir(exist_ok=True)
@@ -338,35 +427,17 @@ def main():
 
     print("[5/6] cost sweep and review policy", flush=True)
     # --- costs ----------------------------------------------------------------
-    sw_ft, sw_coco = sweep(s_ft, labels), sweep(s_coco, labels)
-    policy = review_policy(s_ft, labels)
-    baselines = {
-        "predict_nothing_always_pass": cost_per_1000(0.0, 0.0),
-        "predict_all_always_fail": cost_per_1000(1.0, 1.0),
-        "human_checks_everything": 1000.0 * C_REVIEW,
-        "model_alone_best_threshold": sw_ft["best"]["cost_per_1000"],
-        "model_plus_human_review": policy["cost_per_1000"],
-        "coco_person_proxy_best_threshold": sw_coco["best"]["cost_per_1000"],
-    }
-
     results = {
         "dataset": {"workspace": WORKSPACE, "project": PROJECT, "version": VERSION,
                     "positive_class": POSITIVE_CLASS, "classes": names, "stats": stats},
         "training": {"model": MODEL, "epochs_requested": 1 if SMOKE else EPOCHS, "imgsz": IMGSZ,
                      "batch": BATCH, "seed": SEED, "smoke_test": SMOKE,
                      "weights": str(weights.relative_to(ROOT))},
-        "costs_eur": {"C_FN": C_FN, "C_FP": C_FP, "C_TP": C_TP, "C_TN": C_TN,
-                      "C_REVIEW": C_REVIEW, "base_rate": BASE_RATE, "placeholder": True},
-        "test_set": {"cases": len(stems), "positives": int(labels.sum()),
-                     "base_rate_in_test": float(labels.mean())},
         "box_level": box,
-        "image_level": {"finetuned": sw_ft, "coco_person_proxy": sw_coco},
-        "chosen_single_threshold": sw_ft["best"],
-        "chosen_review_policy": policy,
-        "strategies_cost_per_1000": baselines,
         "note_coco": "COCO has no head/helmet/vest classes, so box-level AP is 0 by construction; "
                      "the image-level proxy flags an image when COCO sees a person.",
     }
+    results.update(cost_sections(s_ft, s_coco, labels))
     (ARTIFACTS / "results.json").write_text(json.dumps(results, indent=2))
     for name in ("results.png", "PR_curve.png", "F1_curve.png"):
         if (train_dir / name).exists():
