@@ -161,7 +161,18 @@ def train(data_yaml: Path):
         old.unlink()
     target = WEIGHTS_DIR / "best.pt"
     shutil.copy(best, target)
-    return target, Path(model.trainer.save_dir)
+    save_dir = Path(model.trainer.save_dir)
+    return target, save_dir
+
+
+def free_memory():
+    """Call between stages, after the previous stage's objects have gone out of scope."""
+    import gc
+
+    import torch
+
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 # ============================================================== evaluation ==
@@ -182,7 +193,7 @@ def box_level_results(weights: Path, data_yaml: Path, names: dict) -> dict:
     ARTIFACTS.mkdir(exist_ok=True)
     for f in Path(m.save_dir).glob("confusion_matrix*.png"):
         shutil.copy(f, ARTIFACTS / f.name)
-    return {
+    out = {
         "overall": {"map50": float(m.box.map50), "map50_95": float(m.box.map)},
         "per_class": per_class,
         "confusion_matrix_labels": [names[i] for i in sorted(names)] + ["background"],
@@ -190,20 +201,34 @@ def box_level_results(weights: Path, data_yaml: Path, names: dict) -> dict:
         "note_confusion_matrix": "Ultralytics default matching (conf 0.25, IoU 0.45), raw counts; "
                                  "rows/cols = classes + background.",
     }
+    return out
 
 
-def image_scores(weights: str, dataset_dir: Path, class_ids: list, split="test"):
-    """One score per image = max confidence of the given classes (0 if none). Plus ground truth."""
+def image_scores(weights: str, dataset_dir: Path, class_ids: list, split="test", chunk=64):
+    """One score per image = max confidence of the given classes (0 if none).
+    Works in small chunks and frees memory between them (Colab RAM is limited)."""
+    import gc
+
+    import torch
     from ultralytics import YOLO
 
     model = YOLO(weights)
     paths = sorted(p for p in (dataset_dir / split / "images").iterdir() if p.suffix.lower() in IMG_EXT)
     scores = {}
-    for r in model.predict(
-        source=[str(p) for p in paths], stream=True, conf=0.001, iou=0.6, imgsz=IMGSZ,
-        classes=class_ids, batch=BATCH, verbose=False,
-    ):
-        scores[Path(r.path).stem] = float(r.boxes.conf.max()) if len(r.boxes) else 0.0
+    for i in range(0, len(paths), chunk):
+        batch = [str(p) for p in paths[i:i + chunk]]
+        for r in model.predict(
+            source=batch, conf=0.001, iou=0.6, imgsz=IMGSZ, classes=class_ids,
+            max_det=100, batch=BATCH, verbose=False,
+        ):
+            scores[Path(r.path).stem] = float(r.boxes.conf.max()) if len(r.boxes) else 0.0
+        del batch
+        gc.collect()
+        if (i // chunk) % 10 == 0:
+            print(f"  scored {min(i + chunk, len(paths))}/{len(paths)} images", flush=True)
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
     return scores
 
 
@@ -280,10 +305,16 @@ def main():
     positive_id = next((i for i, n in names.items() if n == POSITIVE_CLASS), None)
     if positive_id is None:
         raise SystemExit(f"Class {POSITIVE_CLASS!r} not in dataset classes: {names}")
+    print("[1/6] dataset ready", flush=True)
     stats = dataset_stats(dataset_dir, names)
 
+    print("[2/6] training", flush=True)
     weights, train_dir = train(data_yaml)
+    free_memory()
+    print("[3/6] box-level test evaluation", flush=True)
     box = box_level_results(weights, data_yaml, names)
+    free_memory()
+    print("[4/6] image-level scores (finetuned, then COCO)", flush=True)
 
     # --- image-level scores on the test split -------------------------------
     gt = ground_truth(dataset_dir, positive_id)
@@ -300,6 +331,7 @@ def main():
         for s, y, a, b in zip(stems, labels, s_ft, s_coco):
             w.writerow([s, int(y), f"{a:.5f}", f"{b:.5f}"])
 
+    print("[5/6] cost sweep and review policy", flush=True)
     # --- costs ----------------------------------------------------------------
     sw_ft, sw_coco = sweep(s_ft, labels), sweep(s_coco, labels)
     policy = review_policy(s_ft, labels)
