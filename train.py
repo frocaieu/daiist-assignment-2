@@ -69,6 +69,11 @@ BASE_RATE = 0.05  # assumed share of production cases containing a violation (te
 SENS_C_FN = [5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0]
 SENS_BASE_RATE = [0.01, 0.05, 0.10, 0.29]
 
+CM_NOTE = ("Ultralytics matrix from the test-split val run (conf=0.001, IoU 0.45). "
+           "Rows = predicted class, columns = true class; last row/column = background "
+           "(missed objects / unmatched predictions). It counts every detection above conf 0.001, "
+           "so the background column is dominated by low-confidence detections; read class-vs-class "
+           "cells, not the background column.")
 THRESHOLDS = np.round(np.arange(0.01, 1.0, 0.01), 2)
 IMG_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -211,8 +216,7 @@ def box_level_results(weights: Path, data_yaml: Path, names: dict) -> dict:
         "per_class": per_class,
         "confusion_matrix_labels": [names[i] for i in sorted(names)] + ["background"],
         "confusion_matrix": np.asarray(m.confusion_matrix.matrix).tolist(),
-        "note_confusion_matrix": "Ultralytics default matching (conf 0.25, IoU 0.45), raw counts; "
-                                 "rows/cols = classes + background.",
+        "note_confusion_matrix": CM_NOTE,
     }
     return out
 
@@ -378,7 +382,7 @@ def costs_only():
     s_ft, s_coco, labels = load_saved_scores()
     results = json.loads((ARTIFACTS / "results.json").read_text())
     results.update(cost_sections(s_ft, s_coco, labels))
-    results.pop("note_costs", None)
+    results["box_level"]["note_confusion_matrix"] = CM_NOTE  # corrects the note of older runs
     (ARTIFACTS / "results.json").write_text(json.dumps(results, indent=2))
     print(json.dumps({k: results[k] for k in ("costs_eur", "test_set", "chosen_single_threshold",
                                                "chosen_review_policy", "strategies_cost_per_1000")},
