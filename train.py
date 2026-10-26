@@ -34,7 +34,7 @@ ROOT = Path(__file__).resolve().parent
 WEIGHTS_DIR = ROOT / "weights"
 ARTIFACTS = ROOT / "artifacts"
 DATA_DIR = ROOT / "data"
-RUNS_DIR = ROOT / "runs"
+RUNS_DIR = Path(os.environ.get("RUNS_DIR", ROOT / "runs"))  # point to Google Drive on Colab
 CACHE_DIR = ROOT / "cache"  # Ultralytics downloads pretrained .pt files here
 
 # ---------------------------------------------------------------- dataset --
@@ -140,21 +140,26 @@ def dataset_stats(dataset_dir: Path, names: dict) -> dict:
 def train(data_yaml: Path):
     from ultralytics import YOLO
 
-    model = YOLO(MODEL)
-    model.train(
-        data=str(data_yaml),
-        epochs=1 if SMOKE else EPOCHS,
-        fraction=0.05 if SMOKE else 1.0,
-        imgsz=IMGSZ,
-        batch=BATCH,
-        patience=PATIENCE,
-        seed=SEED,
-        deterministic=True,
-        project=str(RUNS_DIR),
-        name="train",
-        exist_ok=True,
-        plots=True,
-    )
+    last = RUNS_DIR / "train" / "weights" / "last.pt"
+    if os.environ.get("RESUME") == "1" and last.exists() and not SMOKE:
+        model = YOLO(str(last))  # continue an interrupted run from its last epoch
+        model.train(resume=True)
+    else:
+        model = YOLO(MODEL)
+        model.train(
+            data=str(data_yaml),
+            epochs=1 if SMOKE else EPOCHS,
+            fraction=0.05 if SMOKE else 1.0,
+            imgsz=IMGSZ,
+            batch=BATCH,
+            patience=PATIENCE,
+            seed=SEED,
+            deterministic=True,
+            project=str(RUNS_DIR),
+            name="train",
+            exist_ok=True,
+            plots=True,
+        )
     best = Path(model.trainer.save_dir) / "weights" / "best.pt"
     WEIGHTS_DIR.mkdir(exist_ok=True)
     for old in WEIGHTS_DIR.glob("*.pt"):
